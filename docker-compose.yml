@@ -1,0 +1,44 @@
+services:
+  api:
+    build: .
+    container_name: support-copilot-api
+    command: .venv/bin/python main.py
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      default:
+        aliases:
+          - api
+          - support-copilot-api
+    volumes:
+      - ./data:/app/data
+      - ./knowledge_base:/app/knowledge_base
+
+  dashboard:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    container_name: support-copilot-dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - default
+
+  # Legacy Streamlit UI (optional — run manually with: streamlit run app.py)
+  # streamlit:
+  #   build: .
+  #   command: .venv/bin/streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+  #   ports:
+  #     - "8501:8501"
