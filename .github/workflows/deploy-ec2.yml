@@ -1,0 +1,203 @@
+name: Deploy to EC2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Inject .env from secret (optional)
+        if: ${{ vars.INJECT_ENV_FILE == 'true' }}
+        run: |
+          printf "%s" "${{ secrets.EC2_ENV_FILE }}" > .env
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf "%s" "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Package release archive
+        run: |
+          tar \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            --exclude='artifacts' \
+            -czf /tmp/release.tar.gz .
+
+      - name: Upload archive to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${EC2_PORT:-22}"
+          HOST="${EC2_HOST_STATIC:-$EC2_HOST}"
+          echo "Uploading archive to ${EC2_USER}@${HOST}:${PORT}"
+          if ! timeout 10 bash -c "cat < /dev/null > /dev/tcp/${HOST}/${PORT}"; then
+            echo "ERROR: Cannot reach ${HOST}:${PORT} from GitHub runner."
+            echo "Check EC2 Security Group/NACL/route table and SSH service."
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if scp -P "$PORT" \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              /tmp/release.tar.gz "${EC2_USER}@${HOST}:/tmp/customer_support_agent_release.tar.gz"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "ERROR: scp failed after ${attempt} attempts."
+              exit 1
+            fi
+            echo "scp attempt ${attempt} failed, retrying..."
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+          EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${EC2_PORT:-22}"
+          HOST="${EC2_HOST_STATIC:-$EC2_HOST}"
+          APP_DIR="${EC2_APP_DIR:-/opt/customer_support_agent}"
+
+          echo "Deploying to ${EC2_USER}@${HOST}:${PORT}"
+          if ! timeout 10 bash -c "cat < /dev/null > /dev/tcp/${HOST}/${PORT}"; then
+            echo "ERROR: Cannot reach ${HOST}:${PORT} from GitHub runner."
+            echo "Check EC2 Security Group/NACL/route table and SSH service."
+            exit 1
+          fi
+
+          for deploy_attempt in 1 2 3; do
+            if ssh -p "$PORT" \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              "${EC2_USER}@${HOST}" \
+              "APP_DIR='${APP_DIR}' bash -s" <<'EOF_REMOTE'; then
+          set -euo pipefail
+
+          if ! mkdir -p "$APP_DIR" 2>/dev/null; then
+            APP_DIR="$HOME/customer_support_agent"
+            mkdir -p "$APP_DIR"
+            echo "APP_DIR not writable, using fallback: $APP_DIR"
+          fi
+
+          tar -xzf /tmp/customer_support_agent_release.tar.gz -C "$APP_DIR"
+
+          cd "$APP_DIR"
+
+          if [ ! -f .env ]; then
+            echo "ERROR: .env missing in $APP_DIR"
+            echo "Create it once on server or set EC2_ENV_FILE secret."
+            exit 1
+          fi
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Docker not found. Installing Docker..."
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y docker.io docker-compose-plugin
+            else
+              echo "ERROR: Unsupported package manager; install Docker manually."
+              exit 1
+            fi
+          fi
+
+          sudo systemctl enable --now docker || true
+
+          if sudo docker compose version >/dev/null 2>&1; then
+            DOCKER_COMPOSE_CMD="sudo docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            DOCKER_COMPOSE_CMD="sudo docker-compose"
+          else
+            echo "ERROR: Docker Compose is not available."
+            exit 1
+          fi
+
+          echo "Reclaiming disk space before build..."
+          sudo docker system df || true
+          $DOCKER_COMPOSE_CMD down --remove-orphans || true
+          sudo docker builder prune -af || true
+          sudo docker image prune -af || true
+          sudo docker container prune -f || true
+          sudo docker system df || true
+
+          $DOCKER_COMPOSE_CMD up -d --build --force-recreate --remove-orphans
+          $DOCKER_COMPOSE_CMD ps
+          HEALTH_URL="http://127.0.0.1:8000/health"
+          HEALTH_WAIT_SECONDS=60
+          HEALTH_INTERVAL_SECONDS=2
+          MAX_ATTEMPTS=$((HEALTH_WAIT_SECONDS / HEALTH_INTERVAL_SECONDS))
+
+          echo "Waiting for API health endpoint: $HEALTH_URL"
+          for health_attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null; then
+              echo "API healthy (attempt $health_attempt/$MAX_ATTEMPTS)"
+              break
+            fi
+
+            if [ "$health_attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "ERROR: API health check failed after ${HEALTH_WAIT_SECONDS}s"
+              $DOCKER_COMPOSE_CMD ps
+              $DOCKER_COMPOSE_CMD logs --tail=200 api
+              exit 1
+            fi
+
+            sleep "$HEALTH_INTERVAL_SECONDS"
+          done
+
+          curl -fsS "$HEALTH_URL"
+          rm -f /tmp/customer_support_agent_release.tar.gz
+          EOF_REMOTE
+              break
+            fi
+            if [ "$deploy_attempt" -eq 3 ]; then
+              echo "ERROR: ssh deploy failed after ${deploy_attempt} attempts."
+              exit 1
+            fi
+            echo "ssh attempt ${deploy_attempt} failed, retrying..."
+            sleep $((deploy_attempt * 5))
+          done
