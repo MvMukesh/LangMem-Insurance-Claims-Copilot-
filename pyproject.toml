@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "customer-support-agent"
+version = "0.1.0"
+description = "AI copilot for claims/support agents with FastAPI, LangChain, LangMem, and ChromaDB"
+readme = "docs/Project_Master_Documentation.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic-settings",
+  "python-dotenv",
+  "langchain",
+  "langchain-core",
+  "langchain-groq",
+  "langchain-google-genai",
+  "langchain-text-splitters",
+  "langmem",
+  "chromadb",
+  "streamlit",
+  "requests",
+  "email-validator",
+  "google-genai",
+  # Optional local embedding stack (disabled to keep EC2 image size low):
+  # "sentence-transformers",
+  # "torch",
+]
+
+[tool.setuptools.packages.find]
+include = ["customer_support_agent*"]
+
+[tool.uv]
+package = false
+
+# Optional torch CPU index (enable only if uncommenting "torch" above):
+# [tool.uv.sources]
+# torch = { index = "pytorch-cpu" }
+#
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
+
+[dependency-groups]
+dev = [
+  "playwright>=1.58.0",
+  "pytest",
+]
